@@ -1,205 +1,308 @@
 ################################################################################
-## Program to download EPA gauge data (http://www.epa.ie/hydronet)
+## README – EPA Long-Term Discharge Data Downloader (OPW-style)
+##
+## Overview:
+## Downloads long-term discharge data from EPA Hydronet.
+## Produces:
+##   - Raw 15-min data
+##   - Interpolated 15-min series
+##   - Hourly means (with missing-value thresholds)
+##   - Daily means (00–00 and 09–09)
+## Quality Code
+## Description
+## Good, WR Flow data derived from good quality water level records and within the limits of the rating curve
+## Extrapolated, BL> Flow data that has been extrapolated beyond the upper limit of the rating curve
+## Extrapolated, BL< Flow data that has been extrapolated beyond the lower limit of the rating curve
+## Missing Flow data is missing – either because there is no source water level data or because there is a period where the rating curve is not valid.
+##
+## 2. Adjust settings:
+##      - allowed_missing_hourly_pct: % missing allowed per hour
+##      - allowed_missing_daily_pct: % missing allowed per day
+##
+## Logging:
+## Records first valid timestamp, first regular 15-min block,
+## start/end dates, proportion missing per interval.
+##
+## Requirements:
+## R packages: readxl, lubridate, httr, dplyr, stringr, zoo, tibble, plotly, htmlwidgets
 ################################################################################
 
-# clear datasets
-rm(list = ls())
-gc()
-
-# set time
-Sys.setenv(TZ = "GMT")
+rm(list=ls()); gc()
+Sys.setenv(TZ="GMT")
 
 library(readxl)
 library(lubridate)
-library(statar)
 library(httr)
-library(rjson)
-library(jsonlite)
 library(dplyr)
 library(stringr)
-library(zip)
-library(RANN)
-library(here)
-library(RCurl)
-library(zoo)  # Needed for na.approx used in hourly interpolation
+library(zoo)
+library(tibble)
+library(plotly)
+library(htmlwidgets)
 
-# as is listed on the epa website - there are other codes included in the actual datasets
-quality_codes <- c(
-  "Good, WR" = "Flow data derived from good quality water level records and within the limits of the rating curve",
-  "Extrapolated, BL>" = "Flow data that has been extrapolated beyond the upper limit of the rating curve",
-  "Extrapolated, BL<" = "Flow data that has been extrapolated beyond the lower limit of the rating curve",
-  "Missing" = "Flow data is missing – either because there is no source water level data or because there is a period where the rating curve is not valid."
-)
+################################################################################
+# USER SETTINGS
+################################################################################
+allowed_missing_hourly_pct <- 25
+allowed_missing_daily_pct  <- 5
+plot_gauge_id <- 1041   # Example gauge for plotting
 
-### set working directory
-wkdir<-"K:/Fluvial/Hydrometric_Network/EPA_Gauges/Dwnld_LongTerm_Hydo_EPA"
-wkdir<-"C:/Users/CBroderick/Downloads/EPA/wkdir"
+################################################################################
+# DERIVED THRESHOLDS
+################################################################################
+intervals_per_hour <- 4
+intervals_per_day  <- 96
+max_missing_hourly <- floor(intervals_per_hour * allowed_missing_hourly_pct / 100)
+max_missing_daily  <- floor(intervals_per_day * allowed_missing_daily_pct / 100)
+
+################################################################################
+# WORKING DIRECTORY
+################################################################################
+wkdir <- "C:/Users/CBroderick/Downloads/EPA"
+if(!dir.exists(wkdir)) dir.create(wkdir, recursive=TRUE)
 setwd(wkdir)
 
-### set working directory
-setwd(wkdir)
-dir.create(paste0(wkdir, "/../Q_Output_", Sys.Date()))
-dir.create(paste0(wkdir, "/../Q_Output_", Sys.Date() ,"/Gauges"))
-dir.create(paste0(wkdir, "/../Q_Output_", Sys.Date() ,"/log"))
+out_dir <- file.path(wkdir, paste0("Q_Output_", Sys.Date()))
+dir.create(out_dir, showWarnings=FALSE)
+dir.create(file.path(out_dir,"Gauges"), showWarnings=FALSE)
+dir.create(file.path(out_dir,"log"), showWarnings=FALSE)
 
-### Get a list of all the potential gauges available from 
-all_stats<-read_excel(paste0(wkdir, "/../Register-Hydrometric-stations-Ireland-2025.xlsx"))
+################################################################################
+# LOAD EPA STATION LIST
+################################################################################
+all_stats <- read_excel(file.path(wkdir,
+                                  "/Register-Hydrometric-stations-Ireland-2025.xlsx"))
 
 EPA_stats <- all_stats %>%
-  filter(
-    `Responsible Body` == "Environmental Protection Agency",
-    #`Station` == "Active",
-    `Hydrometric Data Available` %in% c(
-      "Water Level and Flow"
+  filter(`Responsible Body`=="Environmental Protection Agency",
+         `Hydrometric Data Available` %in% c("Water Level and Flow"))
+
+gauge_lst <- as.numeric(EPA_stats$`Station Number`)
+gauge_lst_nme <- EPA_stats$`Station Name`
+
+################################################################################
+# INITIALISE LOG
+################################################################################
+n <- length(gauge_lst)
+log_tbl <- tibble(
+  Gauge_ID = gauge_lst,
+  Gauge_Name = gauge_lst_nme,
+  Gauge_Abb = NA,
+  LnkStatus_HD = NA,
+  First_Valid_Timestamp = NA,
+  First_Regular_15min_Timestamp = NA,
+  Start_Date = NA,
+  End_Date = NA,
+  Prop_Missing_15min = NA,
+  Prop_Missing_Hourly = NA,
+  Prop_Missing_Daily_00_00 = NA,
+  Prop_Missing_Daily_09_09 = NA,
+  Data_Regularity = NA,
+  Processed = NA
+)
+
+
+#gauge_lst=1016
+################################################################################
+# MAIN LOOP
+################################################################################
+abb_lst <- c("DUB","MON","CON","CAS","KIK","LIM","ATH")
+
+for(val in seq_along(gauge_lst)){
+
+ # val=1  
+  gauge_sel <- gauge_lst[val]
+  gauge_sel_adj <- str_pad(gauge_sel, 5, pad="0")
+  cat("Processing gauge:", gauge_sel, "\n")
+  
+  dest_dir <- file.path(out_dir, "Gauges", paste0("GaugeID_", gauge_sel))
+  dir.create(dest_dir, showWarnings=FALSE)
+  
+  # SKIP IF ALREADY PROCESSED
+  if(file.exists(file.path(dest_dir,"Hourly_Discharge.rds"))){
+    cat("Already processed — skipping.\n")
+    log_tbl$Processed[val] <- "Skipped_existing_output"
+    next
+  }
+  
+  # FIND AVAILABLE ABB
+  avail <- FALSE; attempt <- 0
+  while(!avail && attempt < length(abb_lst)){
+    attempt <- attempt + 1
+    address <- paste0(
+      "https://epawebapp.epa.ie/Hydronet/output/internet/stations/",
+      abb_lst[attempt], "/", gauge_sel_adj, "/Q/complete_15min.zip"
     )
-  )
-
-gauge_lst<-as.numeric(EPA_stats$`Station Number`)
-gauge_lst_nme<-EPA_stats$`Station Name`
-
-# save a list of the gauges with download data available
-gauge_process_lst = matrix(NA, length(gauge_lst), 1)
-gauge_process_lst_nme = matrix(NA, length(gauge_lst), 1)
-gauge_process_log = matrix(NA, length(gauge_lst), 1)
-gauge_process_abb = matrix(NA, length(gauge_lst), 1)
-
-# run a loop to download all datasets from teh EPA website
-# the programme works by attempting to download and appended the data for all stations
-# if they are not processed successfully then they are assumed not to have one of the required datasets
-# Information on whether a gauge was processed successfully is stored in a log file
-for (val in seq(from=1, to=length(gauge_lst))){
-  print((val/length(gauge_lst))*100)
+    res <- httr::HEAD(address)
+    avail <- httr::status_code(res)==200
+  }
+  
+  if(!avail){
+    cat("No valid URL found.\n")
+    log_tbl$Processed[val] <- "No_URL"
+    next
+  }
+  
+  log_tbl$Gauge_Abb[val] <- abb_lst[attempt]
+  log_tbl$LnkStatus_HD[val] <- httr::status_code(res)
+  
   tryCatch({
+    # DOWNLOAD + READ
+    download.file(address, file.path(dest_dir,"Discharge_complete.zip"), quiet=TRUE)
+    unzip(file.path(dest_dir,"Discharge_complete.zip"), exdir=dest_dir)
+    file.remove(file.path(dest_dir,"Discharge_complete.zip"))
     
-    gauge_sel<-gauge_lst[val]
-    print(gauge_sel)
-    gauge_sel_adj<-str_pad(gauge_sel, 5, "pad"=0)
-    gauge_process_lst[val]<-gauge_lst[val]
-    gauge_process_lst_nme[val]<-gauge_lst_nme[val]
+    csv_file <- list.files(dest_dir, pattern="complete_15min.csv", full.names=TRUE)
+    complete <- read.csv(csv_file, sep=";", skip=6)
+    file.remove(csv_file)
     
-    dest_dir<-paste0(wkdir, "/../Q_Output_", Sys.Date() ,"/Gauges/GaugeID_", gauge_sel)
-    dir.create(dest_dir)
-    setwd(dest_dir)
+    names(complete) <- c("Timestamp","Discharge","Quality")
+    complete$Timestamp <- as.POSIXct(complete$Timestamp, tz="GMT")
     
-    ######## Download long term stage height above OD from HYDRO-DATA -----------------------------
-    abb_lst=c("DUB","MON", "CON", "CAS", "KIK","LIM", "ATH")
+    # FILTER GOOD QUALITY
+    comp_raw <- complete %>%
+      filter(!is.na(Discharge), Quality %in% c("Good","Extrapolated","Unchecked","Fair"))
     
-    avail <- FALSE
-    attempt <- 0
-    while(isFALSE(avail) && attempt <= length(abb_lst)) {
-      attempt <- attempt + 1
-      address<-paste0("https://epawebapp.epa.ie/Hydronet/output/internet/stations/", abb_lst[attempt], "/", gauge_sel_adj, "/Q/complete_15min.zip")
-      avail<-url.exists(address)
-    }
-    download.file(address, paste("Q_complete.zip", sep=""), silent=TRUE)
-    gauge_process_abb[val]=abb_lst[attempt]
+    # LOG FIRST VALID
+    log_tbl$First_Valid_Timestamp[val] <- min(comp_raw$Timestamp)
     
-    ######## unzip and load file
-    unzip("Q_complete.zip")
+    # FIRST REGULAR 15-MIN BLOCK
+    dt_diff <- diff(as.numeric(comp_raw$Timestamp))/60
+    is_15 <- dt_diff==15
+    rle_15 <- rle(is_15)
+    idx_run <- which(rle_15$values & rle_15$lengths>=4)
+    if(length(idx_run)==0){log_tbl$Processed[val]<-"No_Regular_Block"; next}
+    run_start <- sum(rle_15$lengths[seq_len(idx_run[1]-1)])+1
+    log_tbl$First_Regular_15min_Timestamp[val] <- comp_raw$Timestamp[run_start]
     
-    complete<-read.csv("complete_15min.csv", sep=";", skip=6, header=TRUE)
-    file.remove(list.files(pattern = glob2rx("complete_15min.csv")))
-    names(complete) = c('Timestamp', 'Value', 'Quality.Code')
+    start_time <- min(comp_raw$Timestamp, na.rm = TRUE)
+    end_time   <- max(comp_raw$Timestamp, na.rm = TRUE)
+    log_tbl$Start_Date[val] <- start_time
+    log_tbl$End_Date[val] <- end_time
     
-    ######## Convert datetime format
-    complete$Timestamp = as.POSIXct(complete$Timestamp, tz = 'GMT')
+    # 15-min full series
+    full_ts <- seq(start_time, end_time, by = "15 min")
+    comp_full <- tibble(Timestamp = full_ts) %>%
+      left_join(
+        comp_raw %>%
+          select(Timestamp, Discharge) %>%
+          group_by(Timestamp) %>% slice(1) %>% ungroup(),
+        by = "Timestamp"
+      )
+    comp_full$Discharge <- zoo::na.approx(comp_full$Discharge, x=comp_full$Timestamp,
+                                          maxgap=1, na.rm=FALSE)
     
-    ######## sort data based on the datestamp
-    comp_series_srt_id <- rev(order(as.numeric(complete$Timestamp)))
-    comp_series_srt = complete[comp_series_srt_id,]
+    log_tbl$Prop_Missing_15min[val] <- mean(is.na(comp_full$Discharge))
     
-    ### set up datasets to write
-    Discharge_raw<-comp_series_srt$Value
-    Timestamp_raw <- comp_series_srt$Timestamp
-    Quality_raw <- comp_series_srt$Quality.Code
-    
-    # create a dataframe with data to save
-    comp_series_raw <- cbind.data.frame(Timestamp_raw, Discharge_raw, Quality_raw)
-    
-    print(unique(Quality_raw))
-    
-    #write out as RDS file
-    saveRDS(comp_series_raw, 'Raw_Discharge.rds')
-    write.csv(comp_series_raw, 'Raw_Discharge.csv', row.names = FALSE)
-    
-    ########################### PROCESS INTERPOLATED AND INFILLED DATASETS ######################################
-    # Remove rows with missing values
-    comp_series_raw <- comp_series_raw %>% filter(!is.na(Discharge_raw))
-    
-    # Remove rows where Quality_raw is in the exclude list
-    exclude_codes <- c("Missing", "Unchecked", "Suspect", "Poor")
-    comp_series_raw <- comp_series_raw %>%
-      filter(!(Quality_raw %in% exclude_codes))
-    
-    ######## Actual time stamp
-    act_ts = comp_series_raw$Timestamp_raw
-    
-    ######## create artifical time stamp (from 2024 to current time) and merge
-    gen_ts = rev(seq(ymd_hm('2019-01-01 00:00', tz = "GMT"), Sys.time()+days(15), by = '15 mins'))
-    gen_ts = lubridate::round_date(gen_ts, "15 minutes")
-    
-    # linearly interpolate
-    y_query= approx(comp_series_raw$Timestamp_raw, comp_series_raw$Discharge_raw, gen_ts, method="linear", rule=1)
-    
-    # find the distance of each query point to the  nearest observed point in minutes
-    x_query_nn<-nn2(data=comp_series_raw$Timestamp_raw, query=y_query$x, k=1)
-    x_query_nn$nn.dists=x_query_nn$nn.dists/60
-    
-    # if the distance between the  query point and  the  nearest observed point is >15 mins then
-    # recode the interpolated point as nan
-    y_query_rm<-x_query_nn$nn.dists>15
-    y_query$y[y_query_rm]=NA
-    
-    # tidy up
-    comp_series_interp<-as.data.frame(cbind(y_query$x, y_query$y))
-    names(comp_series_interp)<-c('Timestamp', 'Value')
-    comp_series_interp<-as_tibble(comp_series_interp)
-    comp_series_interp$Timestamp<-as.POSIXct(comp_series_interp$Timestamp, origin='1970-01-01')
-    
-    ### set up datasets to write
-    Discharges_interp<-comp_series_interp$Value
-    Timestamp_interp <- comp_series_interp$Timestamp
-    
-    # create a dataframe with data to save
-    comp_series_interp <- cbind.data.frame(Timestamp_interp, Discharges_interp)
-    
-    #write out as RDS file
-    saveRDS(comp_series_interp, 'Interp_Discharge.rds')
-    write.csv(comp_series_interp, 'Interp_Discharge.csv', row.names = FALSE)
-    
-    ### HOURLY INTERPOLATION - Equivalent to Python's resample('60T').mean().interpolate(limit=6)
-    
-    # Convert the 15-min data to hourly mean values
-    # require at least 2 valid (non-NA) 15-minute values per hour to compute the hourly mean—otherwise set that hour’s value to NA
-    comp_series_hourly <- comp_series_interp %>%
-      mutate(Timestamp_interp = lubridate::ceiling_date(Timestamp_interp, unit = "hour")) %>%
-      group_by(Timestamp_interp) %>%
+    # HOURLY AGGREGATION
+    hourly <- comp_full %>%
+      mutate(Hour=floor_date(Timestamp,"hour")) %>%
+      group_by(Hour) %>%
       summarise(
-        n_values = sum(!is.na(Discharges_interp)),
-        Value = if_else(n_values >= 2,
-                        mean(Discharges_interp, na.rm = TRUE),
-                        NA_real_)
-      ) %>%
-      select(-n_values) %>%  # remove helper column if you want
-      ungroup()
+        n_total=n(),
+        n_valid=sum(!is.na(Discharge)),
+        Discharge=if_else((n_total-n_valid)<=max_missing_hourly,
+                          mean(Discharge, na.rm=TRUE), NA_real_)
+      ) %>% ungroup()
+    log_tbl$Prop_Missing_Hourly[val] <- mean(is.na(hourly$Discharge))
     
-    # Replace NaNs resulting from all-NA groups with NA
-    comp_series_hourly$Value[is.nan(comp_series_hourly$Value)] <- NA
+    # DAILY 00-00
+    daily_00 <- comp_full %>%
+      mutate(Date=as.Date(Timestamp)) %>%
+      group_by(Date) %>%
+      summarise(
+        n_total=n(),
+        n_valid=sum(!is.na(Discharge)),
+        Discharge=if_else((n_total-n_valid)<=max_missing_daily,
+                          mean(Discharge, na.rm=TRUE), NA_real_)
+      ) %>% ungroup()
+    log_tbl$Prop_Missing_Daily_00_00[val] <- mean(is.na(daily_00$Discharge))
     
-    # Interpolate only internal gaps (limit = 6), equivalent to `interpolate(limit=6, limit_area='inside')`
-    comp_series_hourly$Value <- na.approx(comp_series_hourly$Value, maxgap = 6, na.rm = FALSE)
+    # DAILY 09-09
+    daily_09 <- comp_full %>%
+      mutate(Date=as.Date(Timestamp - hours(9))) %>%
+      group_by(Date) %>%
+      summarise(
+        n_total=n(),
+        n_valid=sum(!is.na(Discharge)),
+        Discharge=if_else((n_total-n_valid)<=max_missing_daily,
+                          mean(Discharge, na.rm=TRUE), NA_real_)
+      ) %>% ungroup()
+    log_tbl$Prop_Missing_Daily_09_09[val] <- mean(is.na(daily_09$Discharge))
     
-    # Save as RDS and CSV
-    saveRDS(comp_series_hourly, 'Hourly_Interp_Discharge.rds')
-    write.csv(comp_series_hourly, 'Hourly_Interp_Discharge.csv', row.names = FALSE)
-
-    # save whether the gauge data was processed
-    gauge_process_log[val] = TRUE 
-  }, error=function(e){})
+    # SAVE RDS
+    saveRDS(comp_raw, file.path(dest_dir,"Raw_Discharge.rds"))
+    saveRDS(comp_full, file.path(dest_dir,"Regular_15min_Discharge.rds"))
+    saveRDS(hourly, file.path(dest_dir,"Hourly_Discharge.rds"))
+    saveRDS(daily_00, file.path(dest_dir,"Daily_Discharge_00_00.rds"))
+    saveRDS(daily_09, file.path(dest_dir,"Daily_Discharge_09_09.rds"))
+    
+    log_tbl$Data_Regularity[val] <- ifelse(all(dt_diff==15),"Regular","Irregular")
+    log_tbl$Processed[val] <- TRUE
+    
+    ################################################################################
+    # OPTIONAL: PLOT LAST YEAR FROM LAST VALID RECORD
+    ################################################################################
+    start_plot <- end_time - 365*24*60*60  # last 365 days from last valid timestamp
+    fig <- plot_ly()
+    
+    if(nrow(subset(comp_raw, Timestamp>=start_plot))>0){
+      plot_raw <- subset(comp_raw, Timestamp>=start_plot)
+      fig <- fig %>% add_lines(x=plot_raw$Timestamp, y=plot_raw$Discharge, name="Raw",
+                               line=list(color='gray', width=1))
+    }
+    if(nrow(subset(comp_full, Timestamp>=start_plot))>0){
+      plot_full <- subset(comp_full, Timestamp>=start_plot)
+      fig <- fig %>% add_lines(x=plot_full$Timestamp, y=plot_full$Discharge, name="15-min",
+                               line=list(color='blue', width=1.5))
+    }
+    if(nrow(subset(hourly, Hour>=start_plot))>0){
+      plot_hourly <- subset(hourly, Hour>=start_plot)
+      fig <- fig %>% add_lines(x=plot_hourly$Hour, y=plot_hourly$Discharge, name="Hourly",
+                               line=list(color='green', width=2))
+    }
+    if(nrow(subset(daily_00, Date>=as.Date(start_plot)))>0){
+      plot_daily00 <- subset(daily_00, Date>=as.Date(start_plot))
+      fig <- fig %>% add_lines(x=plot_daily00$Date, y=plot_daily00$Discharge, name="Daily 00-00",
+                               line=list(color='red', width=2, dash='dash'))
+    }
+    if(nrow(subset(daily_09, Date>=as.Date(start_plot)))>0){
+      plot_daily09 <- subset(daily_09, Date>=as.Date(start_plot))
+      fig <- fig %>% add_lines(x=plot_daily09$Date, y=plot_daily09$Discharge, name="Daily 09-09",
+                               line=list(color='orange', width=2, dash='dot'))
+    }
+    
+    #  save widget
+    fig <- fig %>% layout(title=paste("Discharge - Gauge", gauge_sel),
+                          xaxis=list(title="Date"),
+                          yaxis=list(title="Discharge (m³/s)"))
+    htmlwidgets::saveWidget(fig, file.path(dest_dir, paste0("Gauge_",gauge_sel,"_Year_from_end_date.html")))
+    
+  }, error=function(e){
+    cat("Error processing gauge", gauge_sel, ":", e$message, "\n")
+    log_tbl$Processed[val] <- "Error"
+  })
 }
 
-## write log file to show which gauges were processed
-log_processed<-as.data.frame(cbind(unlist(gauge_process_lst), unlist(gauge_process_lst_nme), as.character(gauge_process_log), as.character(gauge_process_abb)))
-names(log_processed)<-c("Gauge_ID",  "Gauge_Name",  "If_Processed", "ADD_CODE")
-write.csv(log_processed, paste(wkdir, "/../Q_Output_", Sys.Date() ,"/log/Log_Processed_LTermObs_Q.csv", sep=""), row.names = FALSE)
+################################################################################
+# SAVE LOG
+################################################################################
 
+log_tbl_out <- log_tbl %>%
+  mutate(
+    First_Valid_Timestamp = if (!all(is.na(First_Valid_Timestamp))) {
+      format(as.POSIXct(First_Valid_Timestamp, tz="GMT"), "%Y-%m-%d %H:%M:%S")
+    } else { NA_character_ },
+    First_Regular_15min_Timestamp = if (!all(is.na(First_Regular_15min_Timestamp))) {
+      format(as.POSIXct(First_Regular_15min_Timestamp, tz="GMT"), "%Y-%m-%d %H:%M:%S")
+    } else { NA_character_ },
+    Start_Date = if (!all(is.na(Start_Date))) {
+      format(as.POSIXct(Start_Date, tz="GMT"), "%Y-%m-%d %H:%M:%S")
+    } else { NA_character_ },
+    End_Date = if (!all(is.na(End_Date))) {
+      format(as.POSIXct(End_Date, tz="GMT"), "%Y-%m-%d %H:%M:%S")
+    } else { NA_character_ }
+  )
+
+write.csv(log_tbl_out, file.path(out_dir,"log","Log_Processed_LTermObs_Q.csv"), row.names=FALSE)
+cat("Processing complete.\n")
